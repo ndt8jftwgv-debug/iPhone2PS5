@@ -1,0 +1,34 @@
+
+name: Inspect iPhone2PS5 project
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Extract and inspect project
+        run: |
+          set -e
+          ZIP=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: Project ZIP not found"
+            exit 1
+          fi
+
+          mkdir extracted
+          unzip -q "$ZIP" -d extracted
+
+          echo "===== PROJECT FILES ====="
+          find extracted -maxdepth 5 -type f | sort
+
+          echo "===== CMAKE FILES ====="
+          find extracted -name "CMakeLists.txt" -o -name "*.cmake"
