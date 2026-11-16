@@ -1,5 +1,5 @@
 
-name: Inspect iPhone2PS5 project
+name: Inspect iPhone2PS5 source
 
 on:
   push:
@@ -9,26 +9,26 @@ on:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download repository
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - name: Extract and inspect project
+      - name: Extract and print source
+        shell: bash
         run: |
-          set -e
-          ZIP=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
-
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: Project ZIP not found"
-            exit 1
-          fi
-
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
+          test -n "$ZIP"
           mkdir extracted
           unzip -q "$ZIP" -d extracted
 
-          echo "===== PROJECT FILES ====="
-          find extracted -maxdepth 5 -type f | sort
+          ROOT="extracted/iPhone2PS5"
 
-          echo "===== CMAKE FILES ====="
-          find extracted -name "CMakeLists.txt" -o -name "*.cmake"
+          echo "===== CMAKE FILE ====="
+          cat "$ROOT/CMakeLists.txt"
+
+          echo "===== PAYLOAD SOURCE ====="
+          cat "$ROOT/src/payload.c"
+
+          echo "===== TECHNICAL STATUS ====="
+          cat "$ROOT/docs/TECHNICAL_STATUS_AR.md"
