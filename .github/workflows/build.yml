@@ -70,26 +70,43 @@ jobs:
           target_link_libraries(iPhone2PS5 PUBLIC ps5sdk_crt)
           CMAKE
 
-          # Diagnostic only: no USB probing and no file transfer.
+          
+          # Diagnostic only: prove payload_main execution using a PS5 system notification.
+          # No USB probing and no file transfer are performed in this build.
           cat > "$ROOT/src/payload.c" <<'C'
           #include <ps5/payload_main.h>
+          #include <stdint.h>
           #include <stdio.h>
+          #include <string.h>
+
+          typedef struct {
+              char reserved[45];
+              char message[3075];
+          } notify_request_t;
+
+          _Static_assert(sizeof(notify_request_t) == 3120,
+                         "Unexpected PS5 notification request size");
+
+          int sceKernelSendNotificationRequest(int device,
+                                               notify_request_t *request,
+                                               size_t size,
+                                               int blocking);
 
           int payload_main(struct payload_args *args)
           {
               (void)args;
 
-              printf("\n");
-              printf("====================================\n");
-              printf(" iPhone2PS5 - diagnostic scaffold\n");
-              printf("====================================\n");
-              printf("Payload entrypoint reached.\n");
-              printf("USB Host probing: NOT IMPLEMENTED.\n");
-              printf("No iPhone connection or file transfer performed.\n");
+              notify_request_t request;
+              memset(&request, 0, sizeof(request));
+              snprintf(request.message, sizeof(request.message), "%s",
+                       "iPhone2PS5: PAYLOAD ENTRYPOINT REACHED. USB NOT TESTED.");
 
+              (void)sceKernelSendNotificationRequest(
+                  0, &request, sizeof(request), 0);
               return 0;
           }
           C
+
 
       - name: Configure PS5SDK
         shell: bash
