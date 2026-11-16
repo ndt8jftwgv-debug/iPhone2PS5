@@ -1,3 +1,4 @@
+
 name: Build iPhone2PS5 diagnostic ELF
 
 on:
@@ -40,10 +41,8 @@ jobs:
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
 
-          # Use the official linker script from the PS5SDK example.
           cp PS5SDK/examples/hello_socket/linker.x "$ROOT/linker.x"
 
-          # Match the official PS5SDK example-project build conventions.
           cat > "$ROOT/CMakeLists.txt" <<'CMAKE'
           cmake_minimum_required(VERSION 3.20)
           project(iPhone2PS5 C CXX ASM)
@@ -70,14 +69,10 @@ jobs:
           target_link_libraries(iPhone2PS5 PUBLIC ps5sdk_crt)
           CMAKE
 
-          
-          # Diagnostic only: prove payload_main execution using a PS5 system notification.
-          # No USB probing and no file transfer are performed in this build.
           cat > "$ROOT/src/payload.c" <<'C'
           #include <ps5/payload_main.h>
           #include <stdint.h>
           #include <stdio.h>
-          #include <string.h>
 
           typedef struct {
               char reserved[45];
@@ -85,7 +80,7 @@ jobs:
           } notify_request_t;
 
           _Static_assert(sizeof(notify_request_t) == 3120,
-                         "Unexpected PS5 notification request size");
+                         "Unexpected notification request size");
 
           int sceKernelSendNotificationRequest(int device,
                                                notify_request_t *request,
@@ -96,17 +91,26 @@ jobs:
           {
               (void)args;
 
-              notify_request_t request;
-              memset(&request, 0, sizeof(request));
+              notify_request_t request = {0};
+
               snprintf(request.message, sizeof(request.message), "%s",
-                       "iPhone2PS5: PAYLOAD ENTRYPOINT REACHED. USB NOT TESTED.");
+                       "iPhone2PS5: PAYLOAD ENTRYPOINT REACHED.");
+
+              int notify_result = sceKernelSendNotificationRequest(
+                  0, &request, sizeof(request), 0);
+
+              notify_request_t result_request = {0};
+
+              snprintf(result_request.message, sizeof(result_request.message),
+                       "iPhone2PS5: notification call returned %d.",
+                       notify_result);
 
               (void)sceKernelSendNotificationRequest(
-                  0, &request, sizeof(request), 0);
+                  0, &result_request, sizeof(result_request), 0);
+
               return 0;
           }
           C
-
 
       - name: Configure PS5SDK
         shell: bash
