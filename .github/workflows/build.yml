@@ -1,5 +1,4 @@
-
-name: Inspect iPhone2PS5 source
+name: Build iPhone2PS5 diagnostic ELF
 
 on:
   push:
@@ -7,28 +6,137 @@ on:
   workflow_dispatch:
 
 jobs:
-  inspect:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Checkout iPhone2PS5
         uses: actions/checkout@v5
 
-      - name: Extract and print source
+      - name: Extract project source
         shell: bash
         run: |
           set -euo pipefail
           ZIP="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
-          test -n "$ZIP"
+          test -n "$ZIP" || { echo "Project ZIP not found in repository root"; exit 1; }
           mkdir extracted
           unzip -q "$ZIP" -d extracted
+          test -f extracted/iPhone2PS5/src/payload.c
 
-          ROOT="extracted/iPhone2PS5"
+      - name: Checkout PS5SDK
+        uses: actions/checkout@v5
+        with:
+          repository: PS5Dev/PS5SDK
+          path: PS5SDK
 
-          echo "===== CMAKE FILE ====="
-          cat "$ROOT/CMakeLists.txt"
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang lld
 
-          echo "===== PAYLOAD SOURCE ====="
-          cat "$ROOT/src/payload.c"
+      - name: Prepare diagnostic payload project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
 
-          echo "===== TECHNICAL STATUS ====="
-          cat "$ROOT/docs/TECHNICAL_STATUS_AR.md"
+          # Use the official linker script from the PS5SDK example.
+          cp PS5SDK/examples/hello_socket/linker.x "$ROOT/linker.x"
+
+          # Match the official PS5SDK example-project build conventions.
+          cat > "$ROOT/CMakeLists.txt" <<'CMAKE'
+          cmake_minimum_required(VERSION 3.20)
+          project(iPhone2PS5 C CXX ASM)
+
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_STANDARD_REQUIRED ON)
+
+          include_directories(SYSTEM "${D_PS5SDK}")
+          include_directories(SYSTEM "${D_PS5SDK}/include")
+
+          add_executable(iPhone2PS5)
+          set_target_properties(iPhone2PS5 PROPERTIES
+              OUTPUT_NAME "iPhone2PS5.elf"
+              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+          )
+
+          if(NOT CMAKE_C_COMPILER_ID MATCHES "[Cc]lang")
+              message(FATAL_ERROR "PS5SDK payloads must be built with Clang")
+          endif()
+
+          file(GLOB SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+          target_sources(iPhone2PS5 PRIVATE ${SRC_FILES})
+          target_link_directories(iPhone2PS5 PUBLIC "${D_PS5SDK}/lib")
+          target_link_libraries(iPhone2PS5 PUBLIC ps5sdk_crt)
+          CMAKE
+
+          # Diagnostic only: no USB probing and no file transfer.
+          cat > "$ROOT/src/payload.c" <<'C'
+          #include <ps5/payload_main.h>
+          #include <stdio.h>
+
+          int payload_main(struct payload_args *args)
+          {
+              (void)args;
+
+              printf("\n");
+              printf("====================================\n");
+              printf(" iPhone2PS5 - diagnostic scaffold\n");
+              printf("====================================\n");
+              printf("Payload entrypoint reached.\n");
+              printf("USB Host probing: NOT IMPLEMENTED.\n");
+              printf("No iPhone connection or file transfer performed.\n");
+
+              return 0;
+          }
+          C
+
+      - name: Configure PS5SDK
+        shell: bash
+        env:
+          PS5SDK: ${{ github.workspace }}/PS5SDK
+        run: |
+          set -euo pipefail
+          cmake -S "$PS5SDK" -B "$PS5SDK/build" -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_TOOLCHAIN_FILE="$PS5SDK/cmake/toolchain-ps5.cmake"
+
+      - name: Build PS5SDK CRT
+        run: |
+          set -euo pipefail
+          cmake --build "$GITHUB_WORKSPACE/PS5SDK/build" \
+            --target ps5sdk_crt --parallel 2
+          test -s "$GITHUB_WORKSPACE/PS5SDK/lib/libps5sdk_crt.a"
+
+      - name: Configure iPhone2PS5 payload
+        shell: bash
+        env:
+          PS5SDK: ${{ github.workspace }}/PS5SDK
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
+          cmake -S "$ROOT" -B "$ROOT/build" -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_TOOLCHAIN_FILE="$PS5SDK/cmake/toolchain-ps5.cmake"
+
+      - name: Build and inspect ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
+          cmake --build "$ROOT/build" --parallel 2
+          ELF="$ROOT/bin/iPhone2PS5.elf"
+          test -s "$ELF"
+          file "$ELF"
+          readelf -h "$ELF"
+          readelf -l "$ELF"
+
+      - name: Upload diagnostic ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhone2PS5-diagnostic-ELF
+          path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
+          if-no-files-found: error
+          retention-days: 14
