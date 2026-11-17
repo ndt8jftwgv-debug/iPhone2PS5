@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 PTP handshake probe ELF
+name: Build iPhone2PS5 PTP OpenSession probe ELF
 
 on:
   push:
@@ -73,7 +73,6 @@ jobs:
               snprintf(request.message, sizeof(request.message), "%s", message);
               sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
           }
-
           static uint32_t le32(const unsigned char *p) {
               return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -81,113 +80,69 @@ jobs:
           static uint16_t le16(const unsigned char *p) {
               return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
           }
-          static int wait_readable(int fd, int ms) {
-              struct pollfd pfd;
-              pfd.fd = fd;
-              pfd.events = POLLIN;
-              pfd.revents = 0;
-              return poll(&pfd, 1, ms);
+          static int read_container(int fd, unsigned char *buf, size_t cap, int timeout_ms) {
+              struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+              int ready = poll(&pfd, 1, timeout_ms);
+              if (ready <= 0) return ready;
+              return (int)read(fd, buf, cap);
           }
 
           int main(void) {
-              const char *out_path = "/dev/usb/1.2.2";
-              const char *in_path  = "/dev/usb/1.2.1";
-              int eo = 0, ei = 0;
-              errno = 0;
-              int outfd = open(out_path, O_WRONLY);
-              if (outfd < 0) eo = errno;
-              errno = 0;
-              int infd = open(in_path, O_RDONLY);
-              if (infd < 0) ei = errno;
-
+              int outfd = open("/dev/usb/1.2.2", O_WRONLY);
+              int infd = open("/dev/usb/1.2.1", O_RDONLY);
               char msg[3075];
               if (outfd < 0 || infd < 0) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: open failed OUT=%d e=%d IN=%d e=%d",
-                           outfd, eo, infd, ei);
+                           "iPhone2PS5 PTP OpenSession: open failed OUT=%d e=%d IN=%d e=%d",
+                           outfd, (outfd < 0 ? errno : 0),
+                           infd, (infd < 0 ? errno : 0));
                   notify(msg);
                   if (outfd >= 0) close(outfd);
                   if (infd >= 0) close(infd);
                   return 0;
               }
 
-              /* PTP GetDeviceInfo (0x1001): read-only device information request. */
-              const unsigned char command[12] = {
-                  0x10,0x00,0x00,0x00,
-                  0x01,0x00,
-                  0x01,0x10,
-                  0x00,0x00,0x00,0x00
+              /* PTP OpenSession: 12-byte header + one 32-bit SessionID parameter. */
+              const unsigned char open_session[16] = {
+                  0x10,0x00,0x00,0x00, 0x01,0x00, 0x02,0x10,
+                  0x00,0x00,0x00,0x00, 0x01,0x00,0x00,0x00
               };
-
               errno = 0;
-              ssize_t sent = write(outfd, command, sizeof(command));
-              int write_errno = (sent < 0) ? errno : 0;
-              if (sent != (ssize_t)sizeof(command)) {
+              ssize_t sent = write(outfd, open_session, sizeof(open_session));
+              int we = (sent < 0) ? errno : 0;
+              if (sent != (ssize_t)sizeof(open_session)) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: 12-byte command write=%ld errno=%d",
-                           (long)sent, write_errno);
+                           "iPhone2PS5 PTP OpenSession: write=%ld errno=%d",
+                           (long)sent, we);
                   notify(msg);
                   close(outfd); close(infd);
                   return 0;
               }
 
-              unsigned char data[4096] = {0};
-              int ready = wait_readable(infd, 5000);
-              if (ready <= 0) {
-                  snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: sent=12; bulk IN no data poll=%d errno=%d",
-                           ready, errno);
-                  notify(msg);
-                  close(outfd); close(infd);
-                  return 0;
-              }
-
-              errno = 0;
-              ssize_t got = read(infd, data, sizeof(data));
-              int read_errno = (got < 0) ? errno : 0;
+              unsigned char response[512] = {0};
+              int got = read_container(infd, response, sizeof(response), 5000);
               if (got < 12) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: sent=12; read=%ld errno=%d",
-                           (long)got, read_errno);
+                           "iPhone2PS5 PTP OpenSession: sent=16 read=%d errno=%d",
+                           got, (got < 0 ? errno : 0));
                   notify(msg);
                   close(outfd); close(infd);
                   return 0;
               }
 
-              uint32_t declared = le32(data);
-              uint16_t type = le16(data + 4);
-              uint16_t code = le16(data + 6);
-              uint32_t txid = le32(data + 8);
-
-              size_t consumed = (size_t)got;
-              while (declared >= 12 && consumed < declared && consumed < sizeof(data)) {
-                  if (wait_readable(infd, 1500) <= 0) break;
-                  ssize_t n = read(infd, data + consumed, sizeof(data) - consumed);
-                  if (n <= 0) break;
-                  consumed += (size_t)n;
-              }
-
-              int response_ready = wait_readable(infd, 3000);
-              unsigned char response[64] = {0};
-              ssize_t response_len = -1;
-              if (response_ready > 0)
-                  response_len = read(infd, response, sizeof(response));
-
+              uint32_t declared = le32(response);
+              uint16_t type = le16(response + 4);
+              uint16_t code = le16(response + 6);
+              uint32_t tx = le32(response + 8);
               snprintf(msg, sizeof(msg),
-                       "iPhone2PS5 PTP: sent=12 data=%ld declared=%u type=0x%04x code=0x%04x tx=%u drained=%lu resp=%ld",
-                       (long)got, declared, type, code, txid,
-                       (unsigned long)consumed, (long)response_len);
-              if (response_len >= 12) {
-                  snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                           " resp-len=%u resp-type=0x%04x resp-code=0x%04x resp-tx=%u",
-                           le32(response), le16(response + 4),
-                           le16(response + 6), le32(response + 8));
-              }
+                       "iPhone2PS5 PTP OpenSession: sent=16 read=%d len=%u type=0x%04x code=0x%04x tx=%u",
+                       got, declared, type, code, tx);
               close(outfd);
               close(infd);
               notify(msg);
               return 0;
           }
+          C
           C
 
           cat > "$ROOT/Makefile" <<'MAKE'
@@ -221,7 +176,7 @@ jobs:
       - name: Upload PTP handshake probe ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-PTP-handshake-probe-ELF
+          name: iPhone2PS5-PTP-OpenSession-probe-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
