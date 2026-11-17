@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 USB config probe ELF
+name: Build iPhone2PS5 USB descriptor diagnostic ELF
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
           SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
           echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Prepare read-only USB configuration probe
+      - name: Prepare read-only USB descriptor diagnostic
         shell: bash
         run: |
           set -euo pipefail
@@ -79,12 +79,22 @@ jobs:
               const char *node = "/dev/ugen1.2";
               int fd = open(node, O_RDONLY | O_NONBLOCK);
               int open_error = (fd < 0) ? errno : 0;
+
               int config = -999;
               int config_rc = -999, config_error = 0;
+
               struct usb_alt_interface alt;
               memset(&alt, 0, sizeof(alt));
               alt.uai_interface_index = 0;
               int alt_rc = -999, alt_error = 0;
+
+              struct usb_device_descriptor dev;
+              memset(&dev, 0, sizeof(dev));
+              int dev_rc = -999, dev_error = 0;
+
+              struct usb_config_descriptor cfg;
+              memset(&cfg, 0, sizeof(cfg));
+              int cfg_rc = -999, cfg_error = 0;
 
               if (fd >= 0) {
                   errno = 0;
@@ -94,16 +104,30 @@ jobs:
                   errno = 0;
                   alt_rc = ioctl(fd, USB_GET_ALTINTERFACE, &alt);
                   alt_error = (alt_rc < 0) ? errno : 0;
+
+                  errno = 0;
+                  dev_rc = ioctl(fd, USB_GET_DEVICE_DESC, &dev);
+                  dev_error = (dev_rc < 0) ? errno : 0;
+
+                  errno = 0;
+                  cfg_rc = ioctl(fd, USB_GET_CONFIG_DESC, &cfg);
+                  cfg_error = (cfg_rc < 0) ? errno : 0;
               }
 
               char msg[3075];
               snprintf(msg, sizeof(msg),
-                       "iPhone2PS5 USB config probe: node=%s fd=%d openerr=%d GET_CONFIG rc=%d err=%d value=%d GET_ALT rc=%d err=%d iface=%u alt=%u",
-                       node, fd, open_error,
-                       config_rc, config_error, config,
-                       alt_rc, alt_error,
-                       (unsigned)alt.uai_interface_index,
-                       (unsigned)alt.uai_alt_index);
+                  "iPhone2PS5 USB descriptor probe: fd=%d openerr=%d GET_CONFIG rc=%d err=%d value=%d GET_ALT rc=%d err=%d iface=%u alt=%u DEV_DESC rc=%d err=%d configs=%u CFG_DESC rc=%d err=%d cfgValue=%u interfaces=%u",
+                  fd, open_error,
+                  config_rc, config_error, config,
+                  alt_rc, alt_error,
+                  (unsigned)alt.uai_interface_index,
+                  (unsigned)alt.uai_alt_index,
+                  dev_rc, dev_error,
+                  (unsigned)dev.bNumConfigurations,
+                  cfg_rc, cfg_error,
+                  (unsigned)cfg.bConfigurationValue,
+                  (unsigned)cfg.bNumInterface);
+
               if (fd >= 0) close(fd);
               notify(msg);
               return 0;
@@ -138,10 +162,10 @@ jobs:
           file "$ELF"
           readelf -h "$ELF"
 
-      - name: Upload USB config probe ELF
+      - name: Upload USB descriptor diagnostic ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-USB-config-probe-ELF
+          name: iPhone2PS5-USB-descriptor-diagnostic-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
