@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 USB endpoint path probe ELF
+name: Build iPhone2PS5 PTP handshake probe ELF
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
           SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
           echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Prepare USB endpoint path probe
+      - name: Prepare read-only PTP handshake probe
         shell: bash
         run: |
           set -euo pipefail
@@ -55,6 +55,8 @@ jobs:
           #include <sys/types.h>
           #include <errno.h>
           #include <fcntl.h>
+          #include <poll.h>
+          #include <stdint.h>
           #include <stdio.h>
           #include <string.h>
           #include <unistd.h>
@@ -72,32 +74,119 @@ jobs:
               sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
           }
 
-          static int try_open(const char *path, int flags, int *saved_errno) {
-              errno = 0;
-              int fd = open(path, flags);
-              *saved_errno = (fd < 0) ? errno : 0;
-              return fd;
+          static uint32_t le32(const unsigned char *p) {
+              return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+          }
+          static uint16_t le16(const unsigned char *p) {
+              return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+          }
+          static int wait_readable(int fd, int ms) {
+              struct pollfd pfd;
+              pfd.fd = fd;
+              pfd.events = POLLIN;
+              pfd.revents = 0;
+              return poll(&pfd, 1, ms);
           }
 
           int main(void) {
               const char *out_path = "/dev/usb/1.2.2";
               const char *in_path  = "/dev/usb/1.2.1";
-              const char *int_path = "/dev/usb/1.2.3";
-              int eo = 0, ei = 0, et = 0;
-
-              int outfd = try_open(out_path, O_WRONLY, &eo);
-              int infd  = try_open(in_path, O_RDONLY, &ei);
-              int intfd = try_open(int_path, O_RDONLY, &et);
+              int eo = 0, ei = 0;
+              errno = 0;
+              int outfd = open(out_path, O_WRONLY);
+              if (outfd < 0) eo = errno;
+              errno = 0;
+              int infd = open(in_path, O_RDONLY);
+              if (infd < 0) ei = errno;
 
               char msg[3075];
-              snprintf(msg, sizeof(msg),
-                       "iPhone2PS5 USB path probe: OUT=%d e=%d IN=%d e=%d INT=%d e=%d; tested /dev/usb/1.2.2 | /dev/usb/1.2.1 | /dev/usb/1.2.3",
-                       outfd, eo, infd, ei, intfd, et);
-              notify(msg);
+              if (outfd < 0 || infd < 0) {
+                  snprintf(msg, sizeof(msg),
+                           "iPhone2PS5 PTP: open failed OUT=%d e=%d IN=%d e=%d",
+                           outfd, eo, infd, ei);
+                  notify(msg);
+                  if (outfd >= 0) close(outfd);
+                  if (infd >= 0) close(infd);
+                  return 0;
+              }
 
-              if (outfd >= 0) close(outfd);
-              if (infd >= 0) close(infd);
-              if (intfd >= 0) close(intfd);
+              /* PTP GetDeviceInfo (0x1001): read-only device information request. */
+              const unsigned char command[16] = {
+                  0x10,0x00,0x00,0x00,
+                  0x01,0x00,
+                  0x01,0x10,
+                  0x00,0x00,0x00,0x00,
+                  0x00,0x00,0x00,0x00
+              };
+
+              errno = 0;
+              ssize_t sent = write(outfd, command, sizeof(command));
+              int write_errno = (sent < 0) ? errno : 0;
+              if (sent != (ssize_t)sizeof(command)) {
+                  snprintf(msg, sizeof(msg),
+                           "iPhone2PS5 PTP: command write=%ld errno=%d",
+                           (long)sent, write_errno);
+                  notify(msg);
+                  close(outfd); close(infd);
+                  return 0;
+              }
+
+              unsigned char data[4096] = {0};
+              int ready = wait_readable(infd, 5000);
+              if (ready <= 0) {
+                  snprintf(msg, sizeof(msg),
+                           "iPhone2PS5 PTP: sent=16; bulk IN no data poll=%d errno=%d",
+                           ready, errno);
+                  notify(msg);
+                  close(outfd); close(infd);
+                  return 0;
+              }
+
+              errno = 0;
+              ssize_t got = read(infd, data, sizeof(data));
+              int read_errno = (got < 0) ? errno : 0;
+              if (got < 12) {
+                  snprintf(msg, sizeof(msg),
+                           "iPhone2PS5 PTP: sent=16; read=%ld errno=%d",
+                           (long)got, read_errno);
+                  notify(msg);
+                  close(outfd); close(infd);
+                  return 0;
+              }
+
+              uint32_t declared = le32(data);
+              uint16_t type = le16(data + 4);
+              uint16_t code = le16(data + 6);
+              uint32_t txid = le32(data + 8);
+
+              size_t consumed = (size_t)got;
+              while (declared >= 12 && consumed < declared && consumed < sizeof(data)) {
+                  if (wait_readable(infd, 1500) <= 0) break;
+                  ssize_t n = read(infd, data + consumed, sizeof(data) - consumed);
+                  if (n <= 0) break;
+                  consumed += (size_t)n;
+              }
+
+              int response_ready = wait_readable(infd, 3000);
+              unsigned char response[64] = {0};
+              ssize_t response_len = -1;
+              if (response_ready > 0)
+                  response_len = read(infd, response, sizeof(response));
+
+              snprintf(msg, sizeof(msg),
+                       "iPhone2PS5 PTP: sent=16 data=%ld declared=%u type=0x%04x code=0x%04x tx=%u drained=%lu resp=%ld",
+                       (long)got, declared, type, code, txid,
+                       (unsigned long)consumed, (long)response_len);
+              if (response_len >= 12) {
+                  snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                           " resp-len=%u resp-type=0x%04x resp-code=0x%04x resp-tx=%u",
+                           le32(response), le16(response + 4),
+                           le16(response + 6), le32(response + 8));
+              }
+              close(outfd);
+              close(infd);
+              notify(msg);
               return 0;
           }
           C
@@ -130,10 +219,10 @@ jobs:
           file "$ELF"
           readelf -h "$ELF"
 
-      - name: Upload USB path probe ELF
+      - name: Upload PTP handshake probe ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-USB-path-probe-ELF
+          name: iPhone2PS5-PTP-handshake-probe-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
