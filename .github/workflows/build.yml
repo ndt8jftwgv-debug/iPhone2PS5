@@ -143,7 +143,6 @@ jobs:
               return 0;
           }
           C
-          C
 
           cat > "$ROOT/Makefile" <<'MAKE'
           PS5_HOST ?= ps5
