@@ -1,18 +1,19 @@
-
-name: Build iPhone2PS5 diagnostic ELF
+name: Build iPhone2PS5 elfldr diagnostic ELF
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout iPhone2PS5
-        uses: actions/checkout@v5
+      - name: Checkout project
+        uses: actions/checkout@v4
 
       - name: Extract project source
         shell: bash
@@ -20,144 +21,100 @@ jobs:
           set -euo pipefail
           ZIP="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
           test -n "$ZIP" || { echo "Project ZIP not found in repository root"; exit 1; }
-          mkdir extracted
+          mkdir -p extracted
           unzip -q "$ZIP" -d extracted
-          test -f extracted/iPhone2PS5/src/payload.c
-
-      - name: Checkout PS5SDK
-        uses: actions/checkout@v5
-        with:
-          repository: PS5Dev/PS5SDK
-          path: PS5SDK
+          test -d extracted/iPhone2PS5
 
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build clang lld
+          sudo apt-get install -y clang-18 lld-18 llvm-18 wget make unzip file binutils
 
-      - name: Prepare diagnostic payload project
+      - name: Download elfldr-compatible PS5 payload SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ps5-payload-sdk"
+          wget -q --show-progress \
+            https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip \
+            -O "$RUNNER_TEMP/ps5-payload-sdk.zip"
+          unzip -q "$RUNNER_TEMP/ps5-payload-sdk.zip" -d "$RUNNER_TEMP/ps5-payload-sdk"
+          SDK_MK="$(find "$RUNNER_TEMP/ps5-payload-sdk" -type f -path '*/toolchain/prospero.mk' -print -quit)"
+          test -n "$SDK_MK" || { echo "SDK toolchain/prospero.mk was not found"; find "$RUNNER_TEMP/ps5-payload-sdk" -maxdepth 3 -type f | head -80; exit 1; }
+          SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
+          echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "Using SDK at: $SDK_DIR"
+
+      - name: Prepare verified hello-world style diagnostic
         shell: bash
         run: |
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
-
-          cp PS5SDK/examples/hello_socket/linker.x "$ROOT/linker.x"
-
-          cat > "$ROOT/CMakeLists.txt" <<'CMAKE'
-          cmake_minimum_required(VERSION 3.20)
-          project(iPhone2PS5 C CXX ASM)
-
-          set(CMAKE_C_STANDARD 11)
-          set(CMAKE_C_STANDARD_REQUIRED ON)
-
-          include_directories(SYSTEM "${D_PS5SDK}")
-          include_directories(SYSTEM "${D_PS5SDK}/include")
-
-          add_executable(iPhone2PS5)
-          set_target_properties(iPhone2PS5 PROPERTIES
-              OUTPUT_NAME "iPhone2PS5.elf"
-              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
-          )
-
-          if(NOT CMAKE_C_COMPILER_ID MATCHES "[Cc]lang")
-              message(FATAL_ERROR "PS5SDK payloads must be built with Clang")
-          endif()
-
-          file(GLOB SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
-          target_sources(iPhone2PS5 PRIVATE ${SRC_FILES})
-          target_link_directories(iPhone2PS5 PUBLIC "${D_PS5SDK}/lib")
-          target_link_libraries(iPhone2PS5 PUBLIC ps5sdk_crt)
-          CMAKE
+          mkdir -p "$ROOT/bin"
 
           cat > "$ROOT/src/payload.c" <<'C'
-          #include <ps5/payload_main.h>
-          #include <stdint.h>
           #include <stdio.h>
+          #include <string.h>
 
-          typedef struct {
-              char reserved[45];
+          typedef struct notify_request {
+              char useless1[45];
               char message[3075];
           } notify_request_t;
 
-          _Static_assert(sizeof(notify_request_t) == 3120,
-                         "Unexpected notification request size");
+          int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
-          int sceKernelSendNotificationRequest(int device,
-                                               notify_request_t *request,
-                                               size_t size,
-                                               int blocking);
-
-          int payload_main(struct payload_args *args)
+          int main(void)
           {
-              (void)args;
-
-              notify_request_t request = {0};
-
+              notify_request_t request;
+              memset(&request, 0, sizeof(request));
               snprintf(request.message, sizeof(request.message), "%s",
-                       "iPhone2PS5: PAYLOAD ENTRYPOINT REACHED.");
-
-              int notify_result = sceKernelSendNotificationRequest(
-                  0, &request, sizeof(request), 0);
-
-              notify_request_t result_request = {0};
-
-              snprintf(result_request.message, sizeof(result_request.message),
-                       "iPhone2PS5: notification call returned %d.",
-                       notify_result);
-
-              (void)sceKernelSendNotificationRequest(
-                  0, &result_request, sizeof(result_request), 0);
-
-              return 0;
+                       "iPhone2PS5 TEST: ENTRYPOINT REACHED");
+              return sceKernelSendNotificationRequest(0, &request,
+                                                       sizeof(request), 0);
           }
           C
 
-      - name: Configure PS5SDK
-        shell: bash
-        env:
-          PS5SDK: ${{ github.workspace }}/PS5SDK
-        run: |
-          set -euo pipefail
-          cmake -S "$PS5SDK" -B "$PS5SDK/build" -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_TOOLCHAIN_FILE="$PS5SDK/cmake/toolchain-ps5.cmake"
+          cat > "$ROOT/Makefile" <<'MAKE'
+          PS5_HOST ?= ps5
+          PS5_PORT ?= 9021
 
-      - name: Build PS5SDK CRT
-        run: |
-          set -euo pipefail
-          cmake --build "$GITHUB_WORKSPACE/PS5SDK/build" \
-            --target ps5sdk_crt --parallel 2
-          test -s "$GITHUB_WORKSPACE/PS5SDK/lib/libps5sdk_crt.a"
+          ifndef PS5_PAYLOAD_SDK
+          $(error PS5_PAYLOAD_SDK is undefined)
+          endif
 
-      - name: Configure iPhone2PS5 payload
-        shell: bash
-        env:
-          PS5SDK: ${{ github.workspace }}/PS5SDK
-        run: |
-          set -euo pipefail
-          ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
-          cmake -S "$ROOT" -B "$ROOT/build" -G Ninja \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_TOOLCHAIN_FILE="$PS5SDK/cmake/toolchain-ps5.cmake"
+          include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
-      - name: Build and inspect ELF
+          ELF := bin/iPhone2PS5.elf
+          CFLAGS := -Wall -Werror -O2
+
+          all: $(ELF)
+
+          $(ELF): src/payload.c
+          	$(CC) $(CFLAGS) -o $@ $^
+
+          clean:
+          	rm -f $(ELF)
+
+          .PHONY: all clean
+          MAKE
+
+      - name: Build ELF with the official payload SDK
         shell: bash
         run: |
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
-          cmake --build "$ROOT/build" --parallel 2
+          make -C "$ROOT" PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK"
           ELF="$ROOT/bin/iPhone2PS5.elf"
           test -s "$ELF"
           file "$ELF"
           readelf -h "$ELF"
           readelf -l "$ELF"
+          readelf -Ws "$ELF" | grep -E 'main|sceKernelSendNotificationRequest' || true
 
       - name: Upload diagnostic ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-diagnostic-ELF
+          name: iPhone2PS5-elfldr-diagnostic-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
