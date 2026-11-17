@@ -112,11 +112,10 @@ jobs:
               }
 
               /* PTP GetDeviceInfo (0x1001): read-only device information request. */
-              const unsigned char command[16] = {
+              const unsigned char command[12] = {
                   0x10,0x00,0x00,0x00,
                   0x01,0x00,
                   0x01,0x10,
-                  0x00,0x00,0x00,0x00,
                   0x00,0x00,0x00,0x00
               };
 
@@ -125,7 +124,7 @@ jobs:
               int write_errno = (sent < 0) ? errno : 0;
               if (sent != (ssize_t)sizeof(command)) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: command write=%ld errno=%d",
+                           "iPhone2PS5 PTP: 12-byte command write=%ld errno=%d",
                            (long)sent, write_errno);
                   notify(msg);
                   close(outfd); close(infd);
@@ -136,7 +135,7 @@ jobs:
               int ready = wait_readable(infd, 5000);
               if (ready <= 0) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: sent=16; bulk IN no data poll=%d errno=%d",
+                           "iPhone2PS5 PTP: sent=12; bulk IN no data poll=%d errno=%d",
                            ready, errno);
                   notify(msg);
                   close(outfd); close(infd);
@@ -148,7 +147,7 @@ jobs:
               int read_errno = (got < 0) ? errno : 0;
               if (got < 12) {
                   snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP: sent=16; read=%ld errno=%d",
+                           "iPhone2PS5 PTP: sent=12; read=%ld errno=%d",
                            (long)got, read_errno);
                   notify(msg);
                   close(outfd); close(infd);
@@ -175,7 +174,7 @@ jobs:
                   response_len = read(infd, response, sizeof(response));
 
               snprintf(msg, sizeof(msg),
-                       "iPhone2PS5 PTP: sent=16 data=%ld declared=%u type=0x%04x code=0x%04x tx=%u drained=%lu resp=%ld",
+                       "iPhone2PS5 PTP: sent=12 data=%ld declared=%u type=0x%04x code=0x%04x tx=%u drained=%lu resp=%ld",
                        (long)got, declared, type, code, txid,
                        (unsigned long)consumed, (long)response_len);
               if (response_len >= 12) {
