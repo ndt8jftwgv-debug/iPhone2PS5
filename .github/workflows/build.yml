@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 USB enumeration probe ELF
+name: Build iPhone2PS5 USB interface probe ELF
 
 on:
   push:
@@ -40,12 +40,11 @@ jobs:
             -O "$RUNNER_TEMP/ps5-payload-sdk.zip"
           unzip -q "$RUNNER_TEMP/ps5-payload-sdk.zip" -d "$RUNNER_TEMP/ps5-payload-sdk"
           SDK_MK="$(find "$RUNNER_TEMP/ps5-payload-sdk" -type f -path '*/toolchain/prospero.mk' -print -quit)"
-          test -n "$SDK_MK" || { echo "SDK toolchain/prospero.mk was not found"; find "$RUNNER_TEMP/ps5-payload-sdk" -maxdepth 3 -type f | head -80; exit 1; }
+          test -n "$SDK_MK" || { echo "SDK toolchain/prospero.mk was not found"; exit 1; }
           SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
           echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
-          echo "Using SDK at: $SDK_DIR"
 
-      - name: Prepare read-only USB enumeration probe
+      - name: Prepare read-only USB interface descriptor probe
         shell: bash
         run: |
           set -euo pipefail
@@ -78,9 +77,10 @@ jobs:
           }
 
           int main(void) {
-              char summary[1800] = {0};
+              char summary[2400] = {0};
               size_t used = 0;
-              int nodes = 0, detected = 0, failed = 0;
+              int nodes = 0, detected = 0, apple = 0, full_ok = 0, full_fail = 0;
+              int total_ifaces = 0, total_eps = 0;
 
               for (int bus = 0; bus < 8; ++bus) {
                   for (int addr = 1; addr < 16; ++addr) {
@@ -89,39 +89,95 @@ jobs:
                       if (access(path, F_OK) != 0) continue;
                       ++nodes;
                       int fd = open(path, O_RDONLY);
-                      if (fd < 0) { ++failed; continue; }
+                      if (fd < 0) continue;
 
-                      struct usb_device_descriptor desc;
-                      memset(&desc, 0, sizeof(desc));
-                      if (ioctl(fd, USB_GET_DEVICE_DESC, &desc) == 0) {
-                          char item[96];
-                          unsigned int vid = UGETW(desc.idVendor);
-                          unsigned int pid = UGETW(desc.idProduct);
-                          ++detected;
-                          snprintf(item, sizeof(item), "%s %04x:%04x", path, vid, pid);
+                      struct usb_device_descriptor dd;
+                      memset(&dd, 0, sizeof(dd));
+                      if (ioctl(fd, USB_GET_DEVICE_DESC, &dd) != 0) {
+                          close(fd);
+                          continue;
+                      }
+
+                      ++detected;
+                      unsigned int vid = UGETW(dd.idVendor);
+                      unsigned int pid = UGETW(dd.idProduct);
+                      if (vid != 0x05ac) {
+                          close(fd);
+                          continue;
+                      }
+                      ++apple;
+
+                      unsigned char raw[8192];
+                      memset(raw, 0, sizeof(raw));
+                      struct usb_gen_descriptor gd;
+                      memset(&gd, 0, sizeof(gd));
+                      gd.ugd_data = raw;
+                      gd.ugd_maxlen = (uint16_t)sizeof(raw);
+                      gd.ugd_config_index = 0;
+
+                      if (ioctl(fd, USB_GET_FULL_DESC, &gd) != 0 || gd.ugd_actlen < 9) {
+                          ++full_fail;
+                          char item[128];
+                          snprintf(item, sizeof(item), "%s Apple %04x:%04x full-desc-error=%d",
+                                   path, vid, pid, errno);
                           size_t n = strlen(item);
                           if (used + n + 3 < sizeof(summary)) {
                               if (used) { memcpy(summary + used, "; ", 2); used += 2; }
                               memcpy(summary + used, item, n + 1);
                               used += n;
                           }
-                      } else {
-                          ++failed;
+                          close(fd);
+                          continue;
+                      }
+
+                      ++full_ok;
+                      int ifaces = 0, eps = 0;
+                      char iface_text[640] = {0};
+                      size_t iu = 0;
+                      uint16_t actual = gd.ugd_actlen;
+                      for (uint16_t off = 0; off + 2 <= actual; ) {
+                          uint8_t len = raw[off];
+                          uint8_t type = raw[off + 1];
+                          if (len < 2 || off + len > actual) break;
+                          if (type == 4 && len >= 9) {
+                              ++ifaces;
+                              char one[64];
+                              snprintf(one, sizeof(one), " I%u=%02x/%02x/%02x",
+                                       (unsigned int)raw[off + 2],
+                                       (unsigned int)raw[off + 5],
+                                       (unsigned int)raw[off + 6],
+                                       (unsigned int)raw[off + 7]);
+                              size_t n = strlen(one);
+                              if (iu + n + 1 < sizeof(iface_text)) {
+                                  memcpy(iface_text + iu, one, n + 1);
+                                  iu += n;
+                              }
+                          } else if (type == 5 && len >= 7) {
+                              ++eps;
+                          }
+                          off = (uint16_t)(off + len);
+                      }
+                      total_ifaces += ifaces;
+                      total_eps += eps;
+
+                      char item[800];
+                      snprintf(item, sizeof(item), "%s Apple %04x:%04x cfg-bytes=%u interfaces=%d endpoints=%d%s",
+                               path, vid, pid, (unsigned int)actual, ifaces, eps, iface_text);
+                      size_t n = strlen(item);
+                      if (used + n + 3 < sizeof(summary)) {
+                          if (used) { memcpy(summary + used, "; ", 2); used += 2; }
+                          memcpy(summary + used, item, n + 1);
+                          used += n;
                       }
                       close(fd);
                   }
               }
 
               char message[3075];
-              if (detected > 0) {
-                  snprintf(message, sizeof(message),
-                           "iPhone2PS5 USB probe: %d device(s) identified; nodes=%d errors=%d. %s",
-                           detected, nodes, failed, summary);
-              } else {
-                  snprintf(message, sizeof(message),
-                           "iPhone2PS5 USB probe: no USB device descriptor read. ugen nodes=%d errors=%d.",
-                           nodes, failed);
-              }
+              snprintf(message, sizeof(message),
+                       "iPhone2PS5 USB IF probe: nodes=%d devices=%d Apple=%d desc-ok=%d desc-fail=%d interfaces=%d endpoints=%d. %s",
+                       nodes, detected, apple, full_ok, full_fail,
+                       total_ifaces, total_eps, summary[0] ? summary : "No Apple interface details.");
               notify(message);
               return 0;
           }
@@ -154,13 +210,12 @@ jobs:
           test -s "$ELF"
           file "$ELF"
           readelf -h "$ELF"
-          readelf -l "$ELF"
           readelf -Ws "$ELF" | grep -E 'main|sceKernelSendNotificationRequest' || true
 
-      - name: Upload USB probe ELF
+      - name: Upload USB interface probe ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-USB-probe-ELF
+          name: iPhone2PS5-USB-interface-probe-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
