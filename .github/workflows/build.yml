@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 USB descriptor diagnostic ELF
+name: Build iPhone2PS5 full USB configuration diagnostic
 
 on:
   push:
@@ -12,45 +12,36 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
-
-      - name: Extract project source
+      - uses: actions/checkout@v4
+      - name: Extract source
         shell: bash
         run: |
           set -euo pipefail
           ZIP="$(find . -maxdepth 1 -type f -iname '*.zip' -print -quit)"
-          test -n "$ZIP" || { echo "Project ZIP not found in repository root"; exit 1; }
+          test -n "$ZIP"
           mkdir -p extracted
           unzip -q "$ZIP" -d extracted
           test -d extracted/iPhone2PS5
-
-      - name: Install build tools
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-18 lld-18 llvm-18 wget make unzip file binutils
-
-      - name: Download PS5 payload SDK
+      - name: Download PS5 SDK
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ps5-payload-sdk"
-          wget -q --show-progress \
-            https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip \
-            -O "$RUNNER_TEMP/ps5-payload-sdk.zip"
-          unzip -q "$RUNNER_TEMP/ps5-payload-sdk.zip" -d "$RUNNER_TEMP/ps5-payload-sdk"
-          SDK_MK="$(find "$RUNNER_TEMP/ps5-payload-sdk" -type f -path '*/toolchain/prospero.mk' -print -quit)"
-          test -n "$SDK_MK" || { echo "SDK toolchain/prospero.mk was not found"; exit 1; }
-          SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
-          echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
-
-      - name: Prepare read-only USB descriptor diagnostic
+          mkdir -p "$RUNNER_TEMP/sdk"
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip -O "$RUNNER_TEMP/sdk.zip"
+          unzip -q "$RUNNER_TEMP/sdk.zip" -d "$RUNNER_TEMP/sdk"
+          MK="$(find "$RUNNER_TEMP/sdk" -type f -path '*/toolchain/prospero.mk' -print -quit)"
+          test -n "$MK"
+          echo "PS5_PAYLOAD_SDK=${MK%/toolchain/prospero.mk}" >> "$GITHUB_ENV"
+      - name: Create read-only descriptor parser
         shell: bash
         run: |
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
           mkdir -p "$ROOT/bin"
-
           cat > "$ROOT/src/payload.c" <<'C'
           #include <sys/types.h>
           #include <sys/ioctl.h>
@@ -68,104 +59,122 @@ jobs:
           } notify_request_t;
           int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
-          static void notify(const char *message) {
-              notify_request_t request;
-              memset(&request, 0, sizeof(request));
-              snprintf(request.message, sizeof(request.message), "%s", message);
-              sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
+          static void notify(const char *s) {
+              notify_request_t n;
+              memset(&n, 0, sizeof(n));
+              snprintf(n.message, sizeof(n.message), "%s", s);
+              sceKernelSendNotificationRequest(0, &n, sizeof(n), 0);
           }
 
           int main(void) {
-              const char *node = "/dev/ugen1.2";
-              int fd = open(node, O_RDONLY | O_NONBLOCK);
-              int open_error = (fd < 0) ? errno : 0;
-
-              int config = -999;
-              int config_rc = -999, config_error = 0;
-
-              struct usb_alt_interface alt;
-              memset(&alt, 0, sizeof(alt));
-              alt.uai_interface_index = 0;
-              int alt_rc = -999, alt_error = 0;
-
-              struct usb_device_descriptor dev;
-              memset(&dev, 0, sizeof(dev));
-              int dev_rc = -999, dev_error = 0;
-
-              struct usb_config_descriptor cfg;
-              memset(&cfg, 0, sizeof(cfg));
-              int cfg_rc = -999, cfg_error = 0;
-
-              if (fd >= 0) {
-                  errno = 0;
-                  config_rc = ioctl(fd, USB_GET_CONFIG, &config);
-                  config_error = (config_rc < 0) ? errno : 0;
-
-                  errno = 0;
-                  alt_rc = ioctl(fd, USB_GET_ALTINTERFACE, &alt);
-                  alt_error = (alt_rc < 0) ? errno : 0;
-
-                  errno = 0;
-                  dev_rc = ioctl(fd, USB_GET_DEVICE_DESC, &dev);
-                  dev_error = (dev_rc < 0) ? errno : 0;
-
-                  errno = 0;
-                  cfg_rc = ioctl(fd, USB_GET_CONFIG_DESC, &cfg);
-                  cfg_error = (cfg_rc < 0) ? errno : 0;
+              int fd = open("/dev/ugen1.2", O_RDONLY | O_NONBLOCK);
+              if (fd < 0) {
+                  char m[3075];
+                  snprintf(m, sizeof(m), "USB full descriptor: open failed errno=%d", errno);
+                  notify(m);
+                  return 0;
               }
 
-              char msg[3075];
-              snprintf(msg, sizeof(msg),
-                  "iPhone2PS5 USB descriptor probe: fd=%d openerr=%d GET_CONFIG rc=%d err=%d value=%d GET_ALT rc=%d err=%d iface=%u alt=%u DEV_DESC rc=%d err=%d configs=%u CFG_DESC rc=%d err=%d cfgValue=%u interfaces=%u",
-                  fd, open_error,
-                  config_rc, config_error, config,
-                  alt_rc, alt_error,
-                  (unsigned)alt.uai_interface_index,
-                  (unsigned)alt.uai_alt_index,
-                  dev_rc, dev_error,
-                  (unsigned)dev.bNumConfigurations,
-                  cfg_rc, cfg_error,
-                  (unsigned)cfg.bConfigurationValue,
-                  (unsigned)cfg.bNumInterface);
+              char report[3075];
+              size_t used = 0;
+              int configs_ok = 0;
+              int ptp_count = 0;
+              int total_interfaces = 0;
 
-              if (fd >= 0) close(fd);
-              notify(msg);
+              for (int index = 0; index < 4; index++) {
+                  unsigned char raw[2048];
+                  memset(raw, 0, sizeof(raw));
+                  struct usb_full_desc full;
+                  memset(&full, 0, sizeof(full));
+                  full.ufd_config_index = index;
+                  full.ufd_size = sizeof(raw);
+                  full.ufd_data = raw;
+
+                  errno = 0;
+                  int rc = ioctl(fd, USB_GET_FULL_DESC, &full);
+                  int err = rc < 0 ? errno : 0;
+
+                  if (rc < 0) {
+                      int n = snprintf(report + used, sizeof(report) - used,
+                          "cfgIdx%d rc=%d e=%d; ", index, rc, err);
+                      if (n > 0 && (size_t)n < sizeof(report) - used) used += (size_t)n;
+                      continue;
+                  }
+
+                  configs_ok++;
+                  size_t limit = full.ufd_size;
+                  if (limit > sizeof(raw)) limit = sizeof(raw);
+                  int cfg_value = -1, interfaces = -1;
+                  int in_cfg_ptp = 0;
+                  int ep_count = 0;
+
+                  for (size_t off = 0; off + 2 <= limit; ) {
+                      unsigned len = raw[off];
+                      unsigned type = raw[off + 1];
+                      if (len < 2 || off + len > limit) break;
+
+                      if (type == 2 && len >= 9) {
+                          cfg_value = raw[off + 5];
+                          interfaces = raw[off + 4];
+                      } else if (type == 4 && len >= 9) {
+                          unsigned cls = raw[off + 5];
+                          unsigned sub = raw[off + 6];
+                          unsigned proto = raw[off + 7];
+                          if (cls == 6 && sub == 1 && proto == 1) {
+                              ptp_count++;
+                              in_cfg_ptp = 1;
+                          } else {
+                              in_cfg_ptp = 0;
+                          }
+                          total_interfaces++;
+                      } else if (type == 5 && len >= 7) {
+                          ep_count++;
+                      }
+                      off += len;
+                  }
+
+                  int n = snprintf(report + used, sizeof(report) - used,
+                      "cfgIdx%d val=%d ifaces=%d PTP=%d endpoints=%d bytes=%u; ",
+                      index, cfg_value, interfaces, in_cfg_ptp, ep_count,
+                      (unsigned)limit);
+                  if (n > 0 && (size_t)n < sizeof(report) - used) used += (size_t)n;
+              }
+
+              if (used == 0) snprintf(report, sizeof(report), "No configuration descriptors returned");
+              else {
+                  size_t left = sizeof(report) - used;
+                  snprintf(report + used, left,
+                      "RESULT configsOK=%d ptpInterfaces=%d interfacesSeen=%d",
+                      configs_ok, ptp_count, total_interfaces);
+              }
+              close(fd);
+              notify(report);
               return 0;
           }
           C
-
           cat > "$ROOT/Makefile" <<'MAKE'
-          PS5_HOST ?= ps5
-          PS5_PORT ?= 9021
           ifndef PS5_PAYLOAD_SDK
           $(error PS5_PAYLOAD_SDK is undefined)
           endif
           include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
           ELF := bin/iPhone2PS5.elf
-          CFLAGS := -Wall -O2
           all: $(ELF)
           $(ELF): src/payload.c
-          	$(CC) $(CFLAGS) -o $@ $^
-          clean:
-          	rm -f $(ELF)
-          .PHONY: all clean
+          	$(CC) -Wall -O2 -o $@ $^
+          .PHONY: all
           MAKE
-
+          sed -i 's/\\t/	/g' "$ROOT/Makefile"
       - name: Build ELF
         shell: bash
         run: |
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE/extracted/iPhone2PS5"
           make -C "$ROOT" PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK"
-          ELF="$ROOT/bin/iPhone2PS5.elf"
-          test -s "$ELF"
-          file "$ELF"
-          readelf -h "$ELF"
-
-      - name: Upload USB descriptor diagnostic ELF
-        uses: actions/upload-artifact@v4
+          test -s "$ROOT/bin/iPhone2PS5.elf"
+          file "$ROOT/bin/iPhone2PS5.elf"
+      - uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-USB-descriptor-diagnostic-ELF
+          name: iPhone2PS5-USB-full-descriptor-diagnostic
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
