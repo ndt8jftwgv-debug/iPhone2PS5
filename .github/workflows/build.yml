@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 PTP OpenSession probe ELF
+name: Build iPhone2PS5 USB config probe ELF
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
           SDK_DIR="${SDK_MK%/toolchain/prospero.mk}"
           echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
 
-      - name: Prepare read-only PTP handshake probe
+      - name: Prepare read-only USB configuration probe
         shell: bash
         run: |
           set -euo pipefail
@@ -53,9 +53,10 @@ jobs:
 
           cat > "$ROOT/src/payload.c" <<'C'
           #include <sys/types.h>
+          #include <sys/ioctl.h>
+          #include <dev/usb/usb_ioctl.h>
           #include <errno.h>
           #include <fcntl.h>
-          #include <poll.h>
           #include <stdint.h>
           #include <stdio.h>
           #include <string.h>
@@ -73,72 +74,37 @@ jobs:
               snprintf(request.message, sizeof(request.message), "%s", message);
               sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
           }
-          static uint32_t le32(const unsigned char *p) {
-              return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-          }
-          static uint16_t le16(const unsigned char *p) {
-              return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-          }
-          static int read_container(int fd, unsigned char *buf, size_t cap, int timeout_ms) {
-              struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-              int ready = poll(&pfd, 1, timeout_ms);
-              if (ready <= 0) return ready;
-              return (int)read(fd, buf, cap);
-          }
 
           int main(void) {
-              int outfd = open("/dev/usb/1.2.2", O_WRONLY);
-              int infd = open("/dev/usb/1.2.1", O_RDONLY);
+              const char *node = "/dev/ugen1.2";
+              int fd = open(node, O_RDONLY | O_NONBLOCK);
+              int open_error = (fd < 0) ? errno : 0;
+              int config = -999;
+              int config_rc = -999, config_error = 0;
+              struct usb_alt_interface alt;
+              memset(&alt, 0, sizeof(alt));
+              alt.uai_interface_index = 0;
+              int alt_rc = -999, alt_error = 0;
+
+              if (fd >= 0) {
+                  errno = 0;
+                  config_rc = ioctl(fd, USB_GET_CONFIG, &config);
+                  config_error = (config_rc < 0) ? errno : 0;
+
+                  errno = 0;
+                  alt_rc = ioctl(fd, USB_GET_ALTINTERFACE, &alt);
+                  alt_error = (alt_rc < 0) ? errno : 0;
+              }
+
               char msg[3075];
-              if (outfd < 0 || infd < 0) {
-                  snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP OpenSession: open failed OUT=%d e=%d IN=%d e=%d",
-                           outfd, (outfd < 0 ? errno : 0),
-                           infd, (infd < 0 ? errno : 0));
-                  notify(msg);
-                  if (outfd >= 0) close(outfd);
-                  if (infd >= 0) close(infd);
-                  return 0;
-              }
-
-              /* PTP OpenSession: 12-byte header + one 32-bit SessionID parameter. */
-              const unsigned char open_session[16] = {
-                  0x10,0x00,0x00,0x00, 0x01,0x00, 0x02,0x10,
-                  0x00,0x00,0x00,0x00, 0x01,0x00,0x00,0x00
-              };
-              errno = 0;
-              ssize_t sent = write(outfd, open_session, sizeof(open_session));
-              int we = (sent < 0) ? errno : 0;
-              if (sent != (ssize_t)sizeof(open_session)) {
-                  snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP OpenSession: write=%ld errno=%d",
-                           (long)sent, we);
-                  notify(msg);
-                  close(outfd); close(infd);
-                  return 0;
-              }
-
-              unsigned char response[512] = {0};
-              int got = read_container(infd, response, sizeof(response), 5000);
-              if (got < 12) {
-                  snprintf(msg, sizeof(msg),
-                           "iPhone2PS5 PTP OpenSession: sent=16 read=%d errno=%d",
-                           got, (got < 0 ? errno : 0));
-                  notify(msg);
-                  close(outfd); close(infd);
-                  return 0;
-              }
-
-              uint32_t declared = le32(response);
-              uint16_t type = le16(response + 4);
-              uint16_t code = le16(response + 6);
-              uint32_t tx = le32(response + 8);
               snprintf(msg, sizeof(msg),
-                       "iPhone2PS5 PTP OpenSession: sent=16 read=%d len=%u type=0x%04x code=0x%04x tx=%u",
-                       got, declared, type, code, tx);
-              close(outfd);
-              close(infd);
+                       "iPhone2PS5 USB config probe: node=%s fd=%d openerr=%d GET_CONFIG rc=%d err=%d value=%d GET_ALT rc=%d err=%d iface=%u alt=%u",
+                       node, fd, open_error,
+                       config_rc, config_error, config,
+                       alt_rc, alt_error,
+                       (unsigned)alt.uai_interface_index,
+                       (unsigned)alt.uai_alt_index);
+              if (fd >= 0) close(fd);
               notify(msg);
               return 0;
           }
@@ -172,10 +138,10 @@ jobs:
           file "$ELF"
           readelf -h "$ELF"
 
-      - name: Upload PTP handshake probe ELF
+      - name: Upload USB config probe ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-PTP-OpenSession-probe-ELF
+          name: iPhone2PS5-USB-config-probe-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
