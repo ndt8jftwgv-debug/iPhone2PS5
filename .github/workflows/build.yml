@@ -1,4 +1,4 @@
-name: Build iPhone2PS5 elfldr diagnostic ELF
+name: Build iPhone2PS5 USB enumeration probe ELF
 
 on:
   push:
@@ -45,7 +45,7 @@ jobs:
           echo "PS5_PAYLOAD_SDK=$SDK_DIR" >> "$GITHUB_ENV"
           echo "Using SDK at: $SDK_DIR"
 
-      - name: Prepare verified hello-world style diagnostic
+      - name: Prepare read-only USB enumeration probe
         shell: bash
         run: |
           set -euo pipefail
@@ -53,48 +53,94 @@ jobs:
           mkdir -p "$ROOT/bin"
 
           cat > "$ROOT/src/payload.c" <<'C'
+          #include <sys/types.h>
+          #include <sys/ioctl.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdint.h>
           #include <stdio.h>
           #include <string.h>
+          #include <unistd.h>
+          #include <dev/usb/usb.h>
+          #include <dev/usb/usb_ioctl.h>
 
           typedef struct notify_request {
               char useless1[45];
               char message[3075];
           } notify_request_t;
-
           int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
 
-          int main(void)
-          {
+          static void notify(const char *message) {
               notify_request_t request;
               memset(&request, 0, sizeof(request));
-              snprintf(request.message, sizeof(request.message), "%s",
-                       "iPhone2PS5 TEST: ENTRYPOINT REACHED");
-              return sceKernelSendNotificationRequest(0, &request,
-                                                       sizeof(request), 0);
+              snprintf(request.message, sizeof(request.message), "%s", message);
+              sceKernelSendNotificationRequest(0, &request, sizeof(request), 0);
+          }
+
+          int main(void) {
+              char summary[1800] = {0};
+              size_t used = 0;
+              int nodes = 0, detected = 0, failed = 0;
+
+              for (int bus = 0; bus < 8; ++bus) {
+                  for (int addr = 1; addr < 16; ++addr) {
+                      char path[32];
+                      snprintf(path, sizeof(path), "/dev/ugen%d.%d", bus, addr);
+                      if (access(path, F_OK) != 0) continue;
+                      ++nodes;
+                      int fd = open(path, O_RDONLY);
+                      if (fd < 0) { ++failed; continue; }
+
+                      struct usb_device_descriptor desc;
+                      memset(&desc, 0, sizeof(desc));
+                      if (ioctl(fd, USB_GET_DEVICE_DESC, &desc) == 0) {
+                          char item[96];
+                          unsigned int vid = UGETW(desc.idVendor);
+                          unsigned int pid = UGETW(desc.idProduct);
+                          ++detected;
+                          snprintf(item, sizeof(item), "%s %04x:%04x", path, vid, pid);
+                          size_t n = strlen(item);
+                          if (used + n + 3 < sizeof(summary)) {
+                              if (used) { memcpy(summary + used, "; ", 2); used += 2; }
+                              memcpy(summary + used, item, n + 1);
+                              used += n;
+                          }
+                      } else {
+                          ++failed;
+                      }
+                      close(fd);
+                  }
+              }
+
+              char message[3075];
+              if (detected > 0) {
+                  snprintf(message, sizeof(message),
+                           "iPhone2PS5 USB probe: %d device(s) identified; nodes=%d errors=%d. %s",
+                           detected, nodes, failed, summary);
+              } else {
+                  snprintf(message, sizeof(message),
+                           "iPhone2PS5 USB probe: no USB device descriptor read. ugen nodes=%d errors=%d.",
+                           nodes, failed);
+              }
+              notify(message);
+              return 0;
           }
           C
 
           cat > "$ROOT/Makefile" <<'MAKE'
           PS5_HOST ?= ps5
           PS5_PORT ?= 9021
-
           ifndef PS5_PAYLOAD_SDK
           $(error PS5_PAYLOAD_SDK is undefined)
           endif
-
           include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
-
           ELF := bin/iPhone2PS5.elf
           CFLAGS := -Wall -Werror -O2
-
           all: $(ELF)
-
           $(ELF): src/payload.c
           	$(CC) $(CFLAGS) -o $@ $^
-
           clean:
           	rm -f $(ELF)
-
           .PHONY: all clean
           MAKE
 
@@ -111,10 +157,10 @@ jobs:
           readelf -l "$ELF"
           readelf -Ws "$ELF" | grep -E 'main|sceKernelSendNotificationRequest' || true
 
-      - name: Upload diagnostic ELF
+      - name: Upload USB probe ELF
         uses: actions/upload-artifact@v4
         with:
-          name: iPhone2PS5-elfldr-diagnostic-ELF
+          name: iPhone2PS5-USB-probe-ELF
           path: extracted/iPhone2PS5/bin/iPhone2PS5.elf
           if-no-files-found: error
           retention-days: 14
